@@ -1,0 +1,115 @@
+name: Spring Boot PostgreSQL CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    name: Stage 1 - Test (PostgreSQL 15)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: testdb_ci
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: secret
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d testdb_ci"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Map postgres alias to 127.0.0.1
+        run: echo "127.0.0.1 postgres" | sudo tee -a /etc/hosts
+
+      - name: Run Spring Boot Tests with Gradle 8.5 JDK 17
+        env:
+          SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/testdb_ci
+          SPRING_DATASOURCE_USERNAME: postgres
+          SPRING_DATASOURCE_PASSWORD: secret
+        run: |
+          docker run --rm --network host \
+            -v "$PWD":/app -w /app \
+            -e SPRING_DATASOURCE_URL \
+            -e SPRING_DATASOURCE_USERNAME \
+            -e SPRING_DATASOURCE_PASSWORD \
+            gradle:8.5-jdk17-alpine gradle test --no-daemon
+
+  build_image:
+    name: Stage 2 - Build & Push Multi-stage Image
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and Push 2 Tags (SHORT_SHA and latest)
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          IMAGE="ghcr.io/${OWNER}/md05-ss08-practice"
+          docker build -t "${IMAGE}:${SHORT_SHA}" -t "${IMAGE}:latest" .
+          docker push "${IMAGE}:${SHORT_SHA}"
+          docker push "${IMAGE}:latest"
+          docker images | grep "md05-ss08-practice"
+
+  deploy:
+    name: Stage 3 - Deploy & Verify
+    needs: build_image
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: testdb_ci
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: secret
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d testdb_ci"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=5
+    steps:
+      - name: Log in to Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull and Verify Deployed Container
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          IMAGE="ghcr.io/${OWNER}/md05-ss08-practice:${SHORT_SHA}"
+          docker pull "$IMAGE"
+          docker run -d --name spring-boot-app --network host \
+            -e SPRING_DATASOURCE_URL=jdbc:postgresql://localhost:5432/testdb_ci \
+            -e SPRING_DATASOURCE_USERNAME=postgres \
+            -e SPRING_DATASOURCE_PASSWORD=secret \
+            "$IMAGE"
+          sleep 8
+          docker ps --filter "name=spring-boot-app"
+          docker logs --tail 25 spring-boot-app
+          docker rm -f spring-boot-app
